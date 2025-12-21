@@ -5,7 +5,11 @@
 #include<stdint.h>
 
 #define GGML_UNUSED(x) (void)(x)
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 11010
+#define GGML_CUDA_ASSUME(x) __builtin_assume(x)
+#else
 #define GGML_CUDA_ASSUME(x)
+#endif
 
 #ifdef GGML_QKK_64
 #define QK_K 64
@@ -81,6 +85,13 @@ static __device__ __forceinline__ int get_int_from_uint8_aligned(const uint8_t *
 #define CC_RDNA1      (CC_OFFSET_AMD + 1010)
 #define CC_RDNA2      (CC_OFFSET_AMD + 1030)
 #define CC_RDNA3      (CC_OFFSET_AMD + 1100)
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= CC_PASCAL
+#define FP16_AVAILABLE
+#endif
+#if defined(FP16_AVAILABLE) && __CUDA_ARCH__ != MIN_CC_DP4A
+#define FAST_FP16_AVAILABLE
+#endif
 
 static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, int c) {
 #if __CUDA_ARCH__ >= MIN_CC_DP4A
@@ -1859,7 +1870,7 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q4_1_q8_1_imp
         sumi = ggml_cuda_dp4a(vi1, u[2*i+1], sumi);
     }
 
-#ifdef GGML_CUDA_F16
+#ifdef FAST_FP16_AVAILABLE
     const float2 tmp = __half22float2(__hmul2(dm4, ds8));
     const float d4d8 = tmp.x;
     const float m4s8 = tmp.y;
@@ -1868,7 +1879,7 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q4_1_q8_1_imp
     const float2 ds8f = __half22float2(ds8);
     const float d4d8 = dm4f.x * ds8f.x;
     const float m4s8 = dm4f.y * ds8f.y;
-#endif // GGML_CUDA_F16
+#endif // FAST_FP16_AVAILABLE
 
     // scale second part of sum by QI8_1/(vdr * QR4_1) to compensate for multiple threads adding it
     return sumi * d4d8 + m4s8 / (QI8_1 / (vdr * QR4_1));
@@ -1930,7 +1941,7 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q5_1_q8_1_imp
         sumi = ggml_cuda_dp4a(vi1, u[2*i+1], sumi); // SIMD dot product of quantized values
     }
 
-#ifdef GGML_CUDA_F16
+#ifdef FAST_FP16_AVAILABLE
     const float2 tmp = __half22float2(__hmul2(dm5, ds8));
     const float d5d8 = tmp.x;
     const float m5s8 = tmp.y;
@@ -1939,7 +1950,7 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q5_1_q8_1_imp
     const float2 ds8f = __half22float2(ds8);
     const float d5d8 = dm5f.x * ds8f.x;
     const float m5s8 = dm5f.y * ds8f.y;
-#endif // GGML_CUDA_F16
+#endif // FAST_FP16_AVAILABLE
 
     // scale second part of sum by QI5_1 / vdr to compensate for multiple threads adding it
     return sumi*d5d8 + m5s8 / (QI5_1 / vdr);
@@ -1973,7 +1984,7 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q8_1_q8_1_imp
         sumi = ggml_cuda_dp4a(v[i], u[i], sumi);
     }
 
-#ifdef GGML_CUDA_F16
+#ifdef FAST_FP16_AVAILABLE
     const float2 tmp = __half22float2(__hmul2(dm8, ds8));
     const float d8d8 = tmp.x;
     const float m8s8 = tmp.y;
@@ -1982,7 +1993,7 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q8_1_q8_1_imp
     const float2 ds8f = __half22float2(ds8);
     const float d8d8 = dm8f.x * ds8f.x;
     const float m8s8 = dm8f.y * ds8f.y;
-#endif // GGML_CUDA_F16
+#endif // FAST_FP16_AVAILABLE
 
     // scale second part of sum by QI8_1/ vdr to compensate for multiple threads adding it
     return sumi*d8d8 + m8s8 / (QI8_1 / vdr);
