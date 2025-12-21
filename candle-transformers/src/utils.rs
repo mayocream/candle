@@ -1,10 +1,24 @@
 //! Apply penalty and repeat_kv
 
-use candle::{Result, Tensor};
+use candle::{DType, Result, Tensor};
+use std::sync::OnceLock;
+use std::time::Instant;
+
+fn penalty_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let enabled = |key: &str| std::env::var(key).ok().as_deref() == Some("1");
+        enabled("KOHARU_LLM_PROFILE") || enabled("CANDLE_PROFILE_SAMPLING")
+    })
+}
 
 pub fn apply_repeat_penalty(logits: &Tensor, penalty: f32, context: &[u32]) -> Result<Tensor> {
     let device = logits.device();
-    let mut logits = logits.to_dtype(candle::DType::F32)?.to_vec1::<f32>()?;
+    let profile = penalty_profile_enabled();
+    let logits = logits.to_dtype(DType::F32)?;
+    let to_vec_start = Instant::now();
+    let mut logits = logits.to_vec1::<f32>()?;
+    let to_vec_dt = to_vec_start.elapsed();
     let mut already_seen = std::collections::HashSet::new();
     for token_id in context {
         if already_seen.contains(token_id) {
@@ -20,7 +34,17 @@ pub fn apply_repeat_penalty(logits: &Tensor, penalty: f32, context: &[u32]) -> R
         }
     }
     let logits_len = logits.len();
-    Tensor::from_vec(logits, logits_len, device)
+    let from_vec_start = Instant::now();
+    let out = Tensor::from_vec(logits, logits_len, device)?;
+    let from_vec_dt = from_vec_start.elapsed();
+    if profile {
+        tracing::debug!(
+            "profile: repeat_penalty d2h {:.3}ms h2d {:.3}ms",
+            to_vec_dt.as_secs_f64() * 1000.0,
+            from_vec_dt.as_secs_f64() * 1000.0
+        );
+    }
+    Ok(out)
 }
 
 /// Repeats a key or value tensor for grouped query attention
