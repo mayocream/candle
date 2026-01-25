@@ -1,9 +1,6 @@
-use crate::{
-    fused_moe::{FusedMoe, MoeCfg},
-    models::{
-        qwen3::{Config as Qwen3Config, Qwen3Attention, Qwen3MLP, Qwen3RotaryEmbedding},
-        with_tracing::{linear_no_bias, Linear, RmsNorm},
-    },
+use crate::models::{
+    qwen3::{Config as Qwen3Config, Qwen3Attention, Qwen3MLP, Qwen3RotaryEmbedding},
+    with_tracing::{linear_no_bias, Linear, RmsNorm},
 };
 use candle::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::{Activation, VarBuilder};
@@ -179,16 +176,14 @@ impl Module for Qwen3SparseMoeBlock {
 #[derive(Debug, Clone)]
 enum Qwen3FeedForward {
     Mlp(Qwen3MLP),
-    NaiveMoE(Qwen3SparseMoeBlock),
-    FusedMoE(FusedMoe),
+    MoE(Qwen3SparseMoeBlock),
 }
 
-impl Qwen3FeedForward {
-    fn forward(&self, xs: &Tensor, is_prefill: bool) -> Result<Tensor> {
+impl Module for Qwen3FeedForward {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
             Self::Mlp(m) => m.forward(xs),
-            Self::NaiveMoE(m) => m.forward(xs),
-            Self::FusedMoE(m) => m.forward(xs, is_prefill),
+            Self::MoE(m) => m.forward(xs),
         }
     }
 }
@@ -210,24 +205,10 @@ impl DecoderLayer {
     ) -> Result<Self> {
         let self_attn = Qwen3Attention::new(&cfg.into(), rotary, vb.pp("self_attn"))?;
 
-        let moe_cfg = MoeCfg {
-            hidden_size: cfg.hidden_size,
-            num_experts: cfg.num_experts,
-            num_experts_per_tok: cfg.num_experts_per_tok,
-            moe_intermediate_size: cfg.moe_intermediate_size,
-            norm_topk_prob: cfg.norm_topk_prob,
-            act: cfg.hidden_act,
-            decoder_sparse_step: None,
-        };
         // Decide whether to use MoE or regular MLP based on layer_idx and decoder_sparse_step
         let feed_forward =
             if cfg.num_experts > 0 && (layer_idx + 1).is_multiple_of(cfg.decoder_sparse_step) {
-                if cfg!(feature = "cuda") {
-                    // Use fused MoE kernel on CUDA
-                    Qwen3FeedForward::FusedMoE(FusedMoe::new(&moe_cfg, vb.pp("mlp"), vb.dtype())?)
-                } else {
-                    Qwen3FeedForward::NaiveMoE(Qwen3SparseMoeBlock::new(cfg, vb.pp("mlp"))?)
-                }
+                Qwen3FeedForward::MoE(Qwen3SparseMoeBlock::new(cfg, vb.pp("mlp"))?)
             } else {
                 Qwen3FeedForward::Mlp(Qwen3MLP::new(&cfg.into(), vb.pp("mlp"))?)
             };
@@ -252,7 +233,7 @@ impl DecoderLayer {
         let h = self.self_attn.forward(&h, mask, offset)?;
         let x = (x + h)?;
         let h2 = self.ln2.forward(&x)?;
-        let h2 = self.feed_forward.forward(&h2, mask.is_some())?;
+        let h2 = h2.apply(&self.feed_forward)?;
         x + h2
     }
 
