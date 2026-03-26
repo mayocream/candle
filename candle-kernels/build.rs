@@ -1,8 +1,7 @@
-use cudaforge::{KernelBuilder, Result};
 use std::env;
 use std::path::PathBuf;
 
-fn main() -> Result<()> {
+fn main() {
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-changed=src/compatibility.cuh");
     println!("cargo::rerun-if-changed=src/cuda_utils.cuh");

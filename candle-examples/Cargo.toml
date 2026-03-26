@@ -60,7 +60,7 @@ tokio = "1.48.0"
 
 [build-dependencies]
 anyhow = { workspace = true }
-cudaforge = { version = "0.1.2", optional = true }
+bindgen_cuda = { version = "0.1.5", optional = true }
 hf-hub = { workspace = true, features = ["tokio"] }
 
 [features]
@@ -75,7 +75,7 @@ cuda = [
     "candle/cuda",
     "candle-nn/cuda",
     "candle-transformers/cuda",
-    "dep:cudaforge",
+    "dep:bindgen_cuda",
 ]
 cudnn = ["candle/cudnn", "candle-nn/cudnn", "candle-transformers/cudnn"]
 flash-attn = ["cuda", "candle-transformers/flash-attn", "dep:candle-flash-attn"]
