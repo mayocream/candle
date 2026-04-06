@@ -38,7 +38,7 @@ pub struct CudaDevice {
     custom_modules: Arc<std::sync::RwLock<HashMap<String, Arc<cudarc::driver::CudaModule>>>>,
     stream: Arc<cudarc::driver::CudaStream>,
     pub(crate) blas: Arc<cudarc::cublas::CudaBlas>,
-    curand: Arc<Mutex<CudaRng>>,
+    curand: Arc<Mutex<Option<CudaRng>>>,
     seed_value: Arc<RwLock<u64>>,
 }
 
@@ -247,6 +247,20 @@ impl CudaDevice {
     pub fn cublas_handle(&self) -> Arc<cudarc::cublas::CudaBlas> {
         self.blas.clone()
     }
+
+    fn with_curand<T>(
+        &self,
+        f: impl FnOnce(&mut cudarc::curand::CudaRng) -> Result<T>,
+    ) -> Result<T> {
+        let seed = *self.seed_value.read().unwrap();
+        let mut curand = self.curand.lock().unwrap();
+        if curand.is_none() {
+            *curand = Some(CudaRng(
+                cudarc::curand::CudaRng::new(seed, self.stream.clone()).w()?,
+            ));
+        }
+        f(&mut curand.as_mut().expect("cuRAND initialized").0)
+    }
 }
 
 impl CudaDevice {
@@ -254,7 +268,6 @@ impl CudaDevice {
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
         let stream = context.new_stream().w()?;
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
-        let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
         let module_store = ModuleStore {
             mdls: [const { None }; kernels::ALL_IDS.len()],
         };
@@ -263,7 +276,7 @@ impl CudaDevice {
             context,
             stream,
             blas: Arc::new(blas),
-            curand: Arc::new(Mutex::new(CudaRng(curand))),
+            curand: Arc::new(Mutex::new(None)),
             modules: Arc::new(std::sync::RwLock::new(module_store)),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
             seed_value: Arc::new(RwLock::new(299792458)),
@@ -278,7 +291,6 @@ impl BackendDevice for CudaDevice {
         let context = cudarc::driver::CudaContext::new(ordinal).w()?;
         let stream = context.default_stream();
         let blas = cudarc::cublas::CudaBlas::new(stream.clone()).w()?;
-        let curand = cudarc::curand::CudaRng::new(299792458, stream.clone()).w()?;
         let module_store = ModuleStore {
             mdls: [const { None }; kernels::ALL_IDS.len()],
         };
@@ -287,7 +299,7 @@ impl BackendDevice for CudaDevice {
             context,
             stream,
             blas: Arc::new(blas),
-            curand: Arc::new(Mutex::new(CudaRng(curand))),
+            curand: Arc::new(Mutex::new(None)),
             modules: Arc::new(std::sync::RwLock::new(module_store)),
             custom_modules: Arc::new(std::sync::RwLock::new(HashMap::new())),
             seed_value: Arc::new(RwLock::new(299792458)),
@@ -295,11 +307,8 @@ impl BackendDevice for CudaDevice {
     }
 
     fn set_seed(&self, seed: u64) -> Result<()> {
-        // We do not call set_seed but instead create a new curand object. This ensures that the
-        // state will be identical and the same random numbers will be generated.
-        let mut curand = self.curand.lock().unwrap();
-        curand.0 = cudarc::curand::CudaRng::new(seed, self.stream.clone()).w()?;
         *self.seed_value.write().unwrap() = seed;
+        *self.curand.lock().unwrap() = None;
         Ok(())
     }
 
@@ -374,7 +383,6 @@ impl BackendDevice for CudaDevice {
 
     fn rand_uniform(&self, shape: &Shape, dtype: DType, lo: f64, up: f64) -> Result<CudaStorage> {
         let elem_count = shape.elem_count();
-        let curand = self.curand.lock().unwrap();
         let slice = match dtype {
             // TODO: Add support for F16 and BF16 though this is likely to require some upstream
             // cudarc changes.
@@ -389,16 +397,16 @@ impl BackendDevice for CudaDevice {
                 op: "rand_uniform",
             })
             .w()?,
-            DType::F32 => {
+            DType::F32 => self.with_curand(|curand| {
                 let mut data = unsafe { self.alloc::<f32>(elem_count)? };
-                curand.0.fill_with_uniform(&mut data).w()?;
-                CudaStorageSlice::F32(data)
-            }
-            DType::F64 => {
+                curand.fill_with_uniform(&mut data).w()?;
+                Ok(CudaStorageSlice::F32(data))
+            })?,
+            DType::F64 => self.with_curand(|curand| {
                 let mut data = unsafe { self.alloc::<f64>(elem_count)? };
-                curand.0.fill_with_uniform(&mut data).w()?;
-                CudaStorageSlice::F64(data)
-            }
+                curand.fill_with_uniform(&mut data).w()?;
+                Ok(CudaStorageSlice::F64(data))
+            })?,
             DType::F8E4M3 | DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => {
                 Err(CudaError::UnsupportedDtype {
                     dtype,
@@ -424,7 +432,6 @@ impl BackendDevice for CudaDevice {
         // TODO: Add support for F16 and BF16 though this is likely to require some upstream
         // cudarc changes.
         let elem_count = shape.elem_count();
-        let curand = self.curand.lock().unwrap();
         // curand can only generate an odd number of values.
         // https://github.com/huggingface/candle/issues/734
         let elem_count_round = if elem_count % 2 == 1 {
@@ -444,19 +451,18 @@ impl BackendDevice for CudaDevice {
                 op: "rand_normal",
             })
             .w()?,
-            DType::F32 => {
+            DType::F32 => self.with_curand(|curand| {
                 let mut data = unsafe { self.alloc::<f32>(elem_count_round)? };
                 curand
-                    .0
                     .fill_with_normal(&mut data, mean as f32, std as f32)
                     .w()?;
-                CudaStorageSlice::F32(data)
-            }
-            DType::F64 => {
+                Ok(CudaStorageSlice::F32(data))
+            })?,
+            DType::F64 => self.with_curand(|curand| {
                 let mut data = unsafe { self.alloc::<f64>(elem_count_round)? };
-                curand.0.fill_with_normal(&mut data, mean, std).w()?;
-                CudaStorageSlice::F64(data)
-            }
+                curand.fill_with_normal(&mut data, mean, std).w()?;
+                Ok(CudaStorageSlice::F64(data))
+            })?,
             DType::F8E4M3 | DType::F6E2M3 | DType::F6E3M2 | DType::F4 | DType::F8E8M0 => {
                 Err(CudaError::UnsupportedDtype {
                     dtype,
