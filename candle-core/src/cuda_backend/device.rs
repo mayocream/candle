@@ -248,6 +248,8 @@ impl CudaDevice {
         self.blas.clone()
     }
 
+    // Delay cuRAND setup until a random op actually needs it so inference-only
+    // CUDA initialization does not depend on cuRAND being available.
     fn with_curand<T>(
         &self,
         f: impl FnOnce(&mut cudarc::curand::CudaRng) -> Result<T>,
