@@ -3,6 +3,24 @@
 #include <stdint.h>
 #include <cuda/std/limits>
 
+#if __CUDA_ARCH__ < 700
+__device__ __half atomicAdd(__half *address, __half val) {
+    unsigned int *address_as_uint = (unsigned int *)((char *)address - ((size_t)address & 2));
+    unsigned int old = *address_as_uint;
+    unsigned int assumed;
+    do {
+        assumed = old;
+        __half assumed_half = (size_t)address & 2 ? __ushort_as_half(old >> 16) : __ushort_as_half(old & 0xffff);
+        __half new_val = __hadd(assumed_half, val);
+        unsigned int new_uint = (size_t)address & 2 ?
+            (old & 0xffff) | (__half_as_ushort(new_val) << 16) :
+            (old & 0xffff0000) | __half_as_ushort(new_val);
+        old = atomicCAS(address_as_uint, assumed, new_uint);
+    } while (assumed != old);
+    return (size_t)address & 2 ? __ushort_as_half(old >> 16) : __ushort_as_half(old & 0xffff);
+}
+#endif
+
 #define WARP_SIZE 32
 const int BLOCK_SIZE = 1024;
 
@@ -530,7 +548,7 @@ fast_argmax(const size_t src_numel, const size_t el_to_sum_per_block,
       uint32_t *dst) {                                                         \
     fast_argmin(src_numel, el_to_sum_per_block, num_dims, info, src, dst);     \
   }                                                                            \
-  extern "C" __global__ void ARGMAX_NAME(                                     \
+  extern "C" __global__ void ARGMAX_NAME(                                      \
       const size_t src_numel, const size_t el_to_sum_per_block,                \
       const size_t num_dims, const size_t *info, const TYPENAME *src,          \
       uint32_t *dst) {                                                         \
