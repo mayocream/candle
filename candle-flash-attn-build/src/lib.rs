@@ -44,6 +44,9 @@ pub fn fetch_cutlass(out_dir: &PathBuf, commit: &str) -> Result<PathBuf> {
         let status = Command::new("git")
             .args([
                 "clone",
+                "--filter=blob:none",
+                "--sparse",
+                "--no-checkout",
                 "--depth",
                 "1",
                 CUTLASS_REPO,
@@ -56,7 +59,7 @@ pub fn fetch_cutlass(out_dir: &PathBuf, commit: &str) -> Result<PathBuf> {
             anyhow::bail!("git clone failed with status: {}", status);
         }
 
-        // Set up sparse checkout to only get the include directory
+        // Set up sparse checkout before checkout so long example/doc paths are never materialized.
         let status = Command::new("git")
             .args(["sparse-checkout", "set", "include"])
             .current_dir(&cutlass_dir)
@@ -81,7 +84,7 @@ pub fn fetch_cutlass(out_dir: &PathBuf, commit: &str) -> Result<PathBuf> {
     }
 
     let status = Command::new("git")
-        .args(["checkout", commit])
+        .args(["checkout", "--detach", commit])
         .current_dir(&cutlass_dir)
         .status()
         .context("Failed to checkout cutlass commit")?;

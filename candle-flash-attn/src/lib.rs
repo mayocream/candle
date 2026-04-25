@@ -1,8 +1,10 @@
-mod ffi;
-
 use candle::backend::BackendStorage;
-use candle::cuda_backend::cudarc::driver::DevicePtr;
-use candle::{CpuStorage, DType, Layout, Result, Shape, Tensor};
+use candle::cuda_backend::cudarc::driver::{
+    sys::CUfunction_attribute_enum, DevicePtr, DevicePtrMut, DeviceRepr, LaunchConfig,
+    PushKernelArg,
+};
+use candle::cuda_backend::WrapErr;
+use candle::{CpuStorage, Layout, Result, Shape, Tensor};
 use half::{bf16, f16};
 
 pub struct FlashAttn {
@@ -13,8 +15,110 @@ pub struct FlashAttn {
     pub softcap: Option<f32>,
 }
 
+const FLASH_ATTN_MODULE: &str = "flash_fwd_hdim128_sm80_driver";
+const FLASH_ATTN_PTX: &str = include_str!(concat!(
+    env!("OUT_DIR"),
+    "/flash_fwd_hdim128_sm80_driver.ptx"
+));
+const BLOCK_M: usize = 128;
+const NUM_THREADS: u32 = 128;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FlashFwdParams {
+    q_ptr: usize,
+    k_ptr: usize,
+    v_ptr: usize,
+    q_batch_stride: i64,
+    k_batch_stride: i64,
+    v_batch_stride: i64,
+    q_row_stride: i64,
+    k_row_stride: i64,
+    v_row_stride: i64,
+    q_head_stride: i64,
+    k_head_stride: i64,
+    v_head_stride: i64,
+    h: i32,
+    h_k: i32,
+    h_h_k_ratio: i32,
+    o_ptr: usize,
+    oaccum_ptr: usize,
+    o_batch_stride: i64,
+    o_row_stride: i64,
+    o_head_stride: i64,
+    p_ptr: usize,
+    softmax_lse_ptr: usize,
+    softmax_lseaccum_ptr: usize,
+    b: i32,
+    seqlen_q: i32,
+    seqlen_k: i32,
+    seqlen_knew: i32,
+    d: i32,
+    seqlen_q_rounded: i32,
+    seqlen_k_rounded: i32,
+    d_rounded: i32,
+    rotary_dim: i32,
+    total_q: i32,
+    scale_softmax: f32,
+    scale_softmax_log2: f32,
+    cu_seqlens_q: usize,
+    cu_seqlens_k: usize,
+    leftpad_k: usize,
+    seqused_k: usize,
+    blockmask: usize,
+    knew_ptr: usize,
+    vnew_ptr: usize,
+    knew_batch_stride: i64,
+    vnew_batch_stride: i64,
+    knew_row_stride: i64,
+    vnew_row_stride: i64,
+    knew_head_stride: i64,
+    vnew_head_stride: i64,
+    rotary_cos_ptr: usize,
+    rotary_sin_ptr: usize,
+    cache_batch_idx: usize,
+    block_table: usize,
+    block_table_batch_stride: i64,
+    page_block_size: i32,
+    p_dropout: f32,
+    p_dropout_in_uint8_t: u8,
+    rp_dropout: f32,
+    scale_softmax_rp_dropout: f32,
+    window_size_left: i32,
+    window_size_right: i32,
+    softcap: f32,
+    rng_state: usize,
+    is_bf16: u8,
+    is_causal: u8,
+    is_seqlens_k_cumulative: u8,
+    is_rotary_interleaved: u8,
+    num_splits: i32,
+    alibi_slopes_ptr: usize,
+    alibi_slopes_batch_stride: i64,
+    unpadded_lse: u8,
+    seqlenq_ngroups_swapped: u8,
+}
+
+unsafe impl DeviceRepr for FlashFwdParams {}
+const _: [(); 440] = [(); std::mem::size_of::<FlashFwdParams>()];
+const _: [(); 8] = [(); std::mem::align_of::<FlashFwdParams>()];
+
 fn round_multiple(x: usize, m: usize) -> usize {
     (x + m - 1) / m * m
+}
+
+fn flash_fwd_func_name(is_bf16: bool, block_n: usize, is_even_mn: bool) -> &'static str {
+    match (is_bf16, block_n, is_even_mn) {
+        (false, 32, true) => "flash_fwd_hdim128_fp16_block32_even",
+        (false, 32, false) => "flash_fwd_hdim128_fp16_block32_uneven",
+        (false, 64, true) => "flash_fwd_hdim128_fp16_block64_even",
+        (false, 64, false) => "flash_fwd_hdim128_fp16_block64_uneven",
+        (true, 32, true) => "flash_fwd_hdim128_bf16_block32_even",
+        (true, 32, false) => "flash_fwd_hdim128_bf16_block32_uneven",
+        (true, 64, true) => "flash_fwd_hdim128_bf16_block64_even",
+        (true, 64, false) => "flash_fwd_hdim128_bf16_block64_uneven",
+        _ => unreachable!("unsupported flash-attn kernel variant"),
+    }
 }
 
 impl FlashAttn {
@@ -88,38 +192,6 @@ impl FlashAttn {
         }
 
         let stream = dev.cuda_stream();
-        let alibi_slopes_ptr = if let Some(alibi_slopes) = &self.alibi_slopes {
-            if alibi_slopes.dtype() != DType::F32 {
-                candle::bail!(
-                    "DType mismatch alibi_slopes {:?}, expected {:?}",
-                    alibi_slopes.dtype(),
-                    DType::F32
-                );
-            }
-
-            let (alibi_slopes, alibi_slopes_layout) = alibi_slopes.storage_and_layout();
-
-            if num_heads != alibi_slopes_layout.shape().dims1()? {
-                candle::bail!(
-                    "shape mismatch alibi_slopes {:?}, expected {:?}",
-                    alibi_slopes_layout.shape(),
-                    (num_heads)
-                );
-            }
-
-            let alibi_slopes = match &*alibi_slopes {
-                candle::Storage::Cuda(c) => c.as_cuda_slice::<f32>()?,
-                _ => candle::bail!("alibi_slopes must be a cuda tensor"),
-            };
-
-            let alibi_slopes = alibi_slopes.slice(alibi_slopes_layout.start_offset()..);
-
-            // Dropping the guard here doesn't seem very safe.
-            let (ptr, _guard) = alibi_slopes.device_ptr(&stream);
-            ptr as *const core::ffi::c_void
-        } else {
-            std::ptr::null()
-        };
 
         // if window_size_left > self.max_seqlen_k or None => -1
         let mut window_size_left = self
@@ -141,10 +213,8 @@ impl FlashAttn {
         let seqlen_k_rounded = round_multiple(seqlen_k, 128);
 
         let elem_count = out_shape.elem_count();
-        let dst = unsafe { dev.alloc::<T>(elem_count)? };
-        let softmax_lse = dev.alloc_zeros::<f32>(b_sz * 128 * num_heads * seqlen_q)?;
-
-        let is_bf16 = if is_bf16 { 1 } else { 0 };
+        let mut dst = unsafe { dev.alloc::<T>(elem_count)? };
+        let mut softmax_lse = dev.alloc_zeros::<f32>(b_sz * 128 * num_heads * seqlen_q)?;
 
         // Causal is the special case where window_size_right == 0 and window_size_left < 0.
         // Local is the more general case where window_size_right >= 0 or window_size_left >= 0.
@@ -160,51 +230,106 @@ impl FlashAttn {
             window_size_right = seqlen_k as i32;
         }
 
+        if head_size != 128 {
+            candle::bail!("this candle-flash-attn build only supports head dimension 128")
+        }
+        if is_causal != 0 || window_size_left >= 0 || window_size_right >= 0 {
+            candle::bail!("this candle-flash-attn build only supports non-causal full attention")
+        }
+        if self.alibi_slopes.is_some() {
+            candle::bail!("this candle-flash-attn build does not support alibi")
+        }
+        let softcap = self.softcap.unwrap_or(0f32);
+        if softcap != 0f32 {
+            candle::bail!("this candle-flash-attn build does not support softcap")
+        }
+
+        let (cc_major, cc_minor) = stream.context().compute_capability().w()?;
+        if cc_major < 8 {
+            candle::bail!("flash-attn requires compute capability 8.0 or newer")
+        }
+        let block_n = if cc_major == 8 && cc_minor > 0 {
+            32
+        } else {
+            64
+        };
+        let is_even_mn = seqlen_q % BLOCK_M == 0 && seqlen_k % block_n == 0;
+        let func_name = flash_fwd_func_name(is_bf16, block_n, is_even_mn);
+        let shared_mem_bytes = match block_n {
+            32 => 48 * 1024,
+            64 => 64 * 1024,
+            _ => unreachable!("unsupported flash-attn block size"),
+        };
+
         unsafe {
-            let (q_ptr, _guard) = q.device_ptr(&stream);
-            let (k_ptr, _guard) = k.device_ptr(&stream);
-            let (v_ptr, _guard) = v.device_ptr(&stream);
-            let (dst_ptr, _guard) = dst.device_ptr(&stream);
-            let (softmax_lse_ptr, _guard) = softmax_lse.device_ptr(&stream);
-            ffi::run_mha(
-                q_ptr as *const core::ffi::c_void,
-                k_ptr as *const core::ffi::c_void,
-                v_ptr as *const core::ffi::c_void,
-                dst_ptr as *const core::ffi::c_void,
-                softmax_lse_ptr as *const core::ffi::c_void,
-                /* alibi_slopes_ptr */ alibi_slopes_ptr,
-                /* cu_seqlens_q_ptr */ std::ptr::null(),
-                /* cu_seqlens_k_ptr */ std::ptr::null(),
-                /* q_batch_stride */ q_stride[0] as u32,
-                /* k_batch_stride */ k_stride[0] as u32,
-                /* v_batch_stride */ v_stride[0] as u32,
-                /* o_batch_stride */ o_stride[0] as u32,
-                /* alibi_slopes_batch_stride */ 0,
-                /* q_row_stride   */ q_stride[q_rank - 3] as u32,
-                /* k_row_stride   */ k_stride[k_rank - 3] as u32,
-                /* v_row_stride   */ v_stride[v_rank - 3] as u32,
-                /* o_row_stride   */ o_stride[o_rank - 3] as u32,
-                /* q_head_stride  */ q_stride[q_rank - 2] as u32,
-                /* k_head_stride  */ k_stride[k_rank - 2] as u32,
-                /* v_head_stride  */ v_stride[v_rank - 2] as u32,
-                /* o_head_stride  */ o_stride[o_rank - 2] as u32,
-                /* b */ b_sz as u32,
-                /* h */ num_heads as u32,
-                /* h_k */ num_heads_k as u32,
-                /* d */ head_size as u32,
-                /* d_rounded */ head_size_rounded as u32,
-                /* softmax_scale*/ self.softmax_scale,
-                /* seqlen_q */ seqlen_q as u32,
-                /* seqlen_k */ seqlen_k as u32,
-                /* seqlen_q_rounded */ seqlen_q_rounded as u32,
-                /* seqlen_k_rounded */ seqlen_k_rounded as u32,
-                /* is_bf16 */ is_bf16,
-                /* is_causal */ is_causal,
-                /* upadded_lse */ 0,
-                /* window_size_left */ window_size_left,
-                /* window_size_right */ window_size_right,
-                /* softcap */ self.softcap.unwrap_or(0f32),
-            )
+            let (q_ptr, _q_guard) = q.device_ptr(&stream);
+            let (k_ptr, _k_guard) = k.device_ptr(&stream);
+            let (v_ptr, _v_guard) = v.device_ptr(&stream);
+            let (dst_ptr, _dst_guard) = dst.device_ptr_mut(&stream);
+            let (softmax_lse_ptr, _softmax_lse_guard) = softmax_lse.device_ptr_mut(&stream);
+
+            let params = FlashFwdParams {
+                q_ptr: q_ptr as usize,
+                k_ptr: k_ptr as usize,
+                v_ptr: v_ptr as usize,
+                q_batch_stride: q_stride[0] as i64,
+                k_batch_stride: k_stride[0] as i64,
+                v_batch_stride: v_stride[0] as i64,
+                q_row_stride: q_stride[q_rank - 3] as i64,
+                k_row_stride: k_stride[k_rank - 3] as i64,
+                v_row_stride: v_stride[v_rank - 3] as i64,
+                q_head_stride: q_stride[q_rank - 2] as i64,
+                k_head_stride: k_stride[k_rank - 2] as i64,
+                v_head_stride: v_stride[v_rank - 2] as i64,
+                h: num_heads as i32,
+                h_k: num_heads_k as i32,
+                h_h_k_ratio: (num_heads / num_heads_k) as i32,
+                o_ptr: dst_ptr as usize,
+                o_batch_stride: o_stride[0] as i64,
+                o_row_stride: o_stride[o_rank - 3] as i64,
+                o_head_stride: o_stride[o_rank - 2] as i64,
+                softmax_lse_ptr: softmax_lse_ptr as usize,
+                b: b_sz as i32,
+                seqlen_q: seqlen_q as i32,
+                seqlen_k: seqlen_k as i32,
+                d: head_size as i32,
+                seqlen_q_rounded: seqlen_q_rounded as i32,
+                seqlen_k_rounded: seqlen_k_rounded as i32,
+                d_rounded: head_size_rounded as i32,
+                scale_softmax: self.softmax_scale,
+                scale_softmax_log2: self.softmax_scale * std::f32::consts::LOG2_E,
+                p_dropout: 1f32,
+                p_dropout_in_uint8_t: 255,
+                rp_dropout: 1f32,
+                scale_softmax_rp_dropout: self.softmax_scale,
+                window_size_left,
+                window_size_right,
+                is_bf16: u8::from(is_bf16),
+                is_seqlens_k_cumulative: 1,
+                num_splits: 1,
+                ..Default::default()
+            };
+
+            let func = dev.get_or_load_custom_func(func_name, FLASH_ATTN_MODULE, FLASH_ATTN_PTX)?;
+            if shared_mem_bytes >= 48 * 1024 {
+                func.set_attribute(
+                    CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    shared_mem_bytes as i32,
+                )
+                .w()?;
+            }
+            let cfg = LaunchConfig {
+                grid_dim: (
+                    seqlen_q.div_ceil(BLOCK_M) as u32,
+                    b_sz as u32,
+                    num_heads as u32,
+                ),
+                block_dim: (NUM_THREADS, 1, 1),
+                shared_mem_bytes: shared_mem_bytes as u32,
+            };
+            let mut builder = func.builder();
+            builder.arg(&params);
+            builder.launch(cfg).w()?;
         }
 
         let dst = candle::CudaStorage::wrap_cuda_slice(dst, dev.clone());
@@ -437,6 +562,7 @@ pub fn flash_attn_alibi_windowed_softcap(
     q.apply_op3(k, v, op)
 }
 
+#[allow(dead_code)]
 struct FlashAttnVarLen {
     pub softmax_scale: f32,
     pub max_seqlen_q: usize,
@@ -450,6 +576,24 @@ struct FlashAttnVarLen {
 }
 
 impl FlashAttnVarLen {
+    #[cfg(not(any()))]
+    fn cuda_fwd_t<
+        T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
+    >(
+        &self,
+        _q: &candle::CudaStorage,
+        _q_l: &Layout,
+        _k: &candle::CudaStorage,
+        _k_l: &Layout,
+        _v: &candle::CudaStorage,
+        _v_l: &Layout,
+        _is_bf16: bool,
+    ) -> Result<(candle::CudaStorage, Shape)> {
+        let _ = std::marker::PhantomData::<T>;
+        candle::bail!("this candle-flash-attn build does not support varlen attention")
+    }
+
+    #[cfg(any())]
     fn cuda_fwd_t<
         T: candle::cuda_backend::CudaDType + candle::cuda_backend::cudarc::driver::DeviceRepr,
     >(

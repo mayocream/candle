@@ -2,14 +2,28 @@
 #include "kernel_helpers.h"
 #include "flash_fwd_launch_template.h"
 
+#include <cstdio>
+#include <cstdlib>
+
 void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
-  FP16_SWITCH(!params.is_bf16, [&] {
-      HEADDIM_SWITCH(params.d, [&] {
-          BOOL_SWITCH(params.is_causal, Is_causal, [&] {
-              run_mha_fwd_<elem_type, kHeadDim, Is_causal>(params, stream);
-          });
-      });
-  });
+    const bool is_dense = params.cu_seqlens_q == nullptr && params.cu_seqlens_k == nullptr;
+    const bool is_full_attention = params.window_size_left < 0 && params.window_size_right < 0;
+    const bool is_plain =
+        params.alibi_slopes_ptr == nullptr && params.softcap == 0.0f && params.num_splits == 1;
+
+    if (params.d != 128 || params.is_causal || !is_dense || !is_full_attention || !is_plain) {
+        std::fprintf(
+            stderr,
+            "candle-flash-attn FLUX2 build supports only non-causal dense "
+            "head-dim-128 fp16/bf16 attention\n");
+        std::abort();
+    }
+
+    if (params.is_bf16) {
+        run_mha_fwd_<cutlass::bfloat16_t, 128, false>(params, stream);
+    } else {
+        run_mha_fwd_<cutlass::half_t, 128, false>(params, stream);
+    }
 }
 
 extern "C" void run_mha(
